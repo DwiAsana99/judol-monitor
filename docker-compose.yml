@@ -1,12 +1,12 @@
+name: judol-monitor
+
 services:
   server:
-    build:
-      context: .
-      dockerfile: server/Dockerfile
+    build: .
     image: judol-monitor-server
     container_name: judol-monitor
     restart: unless-stopped
-    env_file: server/.env
+    env_file: .env
     environment:
       # nginx di host terhubung lewat gateway bridge; hanya IP ini yang boleh
       # mengirim X-Forwarded-For (dibaca uvicorn untuk request.client.host).

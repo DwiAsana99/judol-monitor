@@ -1,19 +1,15 @@
-# Build context = root repo (butuh agent/scan_judol.py untuk probe.py).
-#   docker compose build   (dari root repo)
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DB_PATH=/data/monitor.db \
-    SCANNER_DIR=/app/agent
+    DB_PATH=/data/monitor.db
 
-WORKDIR /app/server
+WORKDIR /app
 
-COPY server/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agent/scan_judol.py /app/agent/scan_judol.py
-COPY server/app.py server/probe.py ./
+COPY app.py probe.py scan_judol.py ./
 
 RUN useradd --system --uid 10001 --home-dir /nonexistent judol \
     && mkdir -p /data && chown judol:judol /data
