@@ -1,0 +1,12 @@
+{
+  "server_url": "https://monitor.example.com",
+  "token": "TOKEN-DARI-PERINTAH-add-host",
+  "host_name": "vps-1",
+  "send_snippets": false,
+  "min_score": 3,
+  "apps": [
+    {"name": "sitasing", "type": "laravel",   "path": "/var/www/sitasing"},
+    {"name": "blog",     "type": "wordpress", "path": "/var/www/blog"},
+    {"name": "api-uvms", "type": "fastapi",   "path": "/opt/uvms"}
+  ]
+}

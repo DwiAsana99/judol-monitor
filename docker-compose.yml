@@ -1,0 +1,30 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: judol-monitor-server
+    container_name: judol-monitor
+    restart: unless-stopped
+    env_file: server/.env
+    environment:
+      # nginx di host terhubung lewat gateway bridge; hanya IP ini yang boleh
+      # mengirim X-Forwarded-For (dibaca uvicorn untuk request.client.host).
+      FORWARDED_ALLOW_IPS: 172.30.0.1
+    volumes:
+      - judol-data:/data
+    # Hanya localhost; publik lewat nginx + HTTPS (lihat README).
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - judol
+
+networks:
+  judol:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+
+volumes:
+  judol-data:
