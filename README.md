@@ -69,16 +69,21 @@ Bot Telegram: buat lewat @BotFather (dapat token), kirim satu pesan ke bot, lalu
 ## nginx + HTTPS
 
 Jangan buka port 8000 langsung ke internet. Pasang nginx + Let's Encrypt di depannya. Agar IP asli VPS
-tercatat (`last_ip`), nginx wajib mengirim header IP klien:
+tercatat (`last_ip`), nginx wajib mengirim `X-Forwarded-For $remote_addr`.
+
+Config siap pakai untuk `monju.dwiputraasana.my.id` (HTTPS, redirect HTTP, rate limit, allowlist opsional):
+[deploy/nginx/monju.dwiputraasana.my.id.conf](deploy/nginx/monju.dwiputraasana.my.id.conf).
+
+Pemasangan di server (Debian/Ubuntu, DNS sudah mengarah ke server):
+```bash
+sudo apt install nginx certbot python3-certbot-nginx
+sudo ufw allow 80,443/tcp                          # jika memakai ufw; buka juga di firewall provider
+sudo certbot certonly --nginx -d monju.dwiputraasana.my.id
+sudo cp deploy/nginx/monju.dwiputraasana.my.id.conf /etc/nginx/conf.d/
+sudo nginx -t && sudo systemctl reload nginx
 ```
-location / {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $remote_addr;
-    proxy_set_header X-Forwarded-Proto $scheme;
-}
-```
-Tambahkan rate limit di nginx untuk `/api/report` dan `/`.
+Perpanjangan sertifikat berjalan otomatis lewat timer certbot. Di agent, isi
+`"server_url": "https://monju.dwiputraasana.my.id"`.
 
 ## Probe cloaking
 
