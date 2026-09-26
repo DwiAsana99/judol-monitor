@@ -63,8 +63,57 @@ User=judol
 | `DB_PATH` | lokasi SQLite (Docker: `/data/monitor.db`) |
 | `FORWARDED_ALLOW_IPS` | IP proxy yang dipercaya mengirim `X-Forwarded-For` (default `127.0.0.1,::1`) |
 
-Bot Telegram: buat lewat @BotFather (dapat token), kirim satu pesan ke bot, lalu buka
-`https://api.telegram.org/bot<TOKEN>/getUpdates` untuk melihat `chat.id`.
+## Alert Telegram
+
+Server mengirim alert lewat bot Telegram ke satu chat: chat pribadi atau grup (disarankan grup, agar
+beberapa admin ikut menerima).
+
+### 1. Buat bot
+1. Di Telegram, buka **@BotFather** → kirim `/newbot`.
+2. Isi nama bot (bebas, mis. `Judol Monitor`) dan username (harus diakhiri `bot`, mis. `judol_monitor_bot`).
+3. BotFather membalas dengan token, bentuknya `123456789:AAH...`. Ini `TELEGRAM_BOT_TOKEN`.
+   Token = kunci penuh bot; jangan dibagikan atau di-commit.
+
+### 2. Dapatkan chat ID
+**Chat pribadi**: buka bot yang baru dibuat, tekan **Start** (atau kirim pesan apa saja).
+
+**Grup**: buat grup, tambahkan bot sebagai anggota, lalu kirim satu pesan di grup yang menyebut bot,
+mis. `/start@judol_monitor_bot`.
+
+Lalu jalankan (di VPS server atau di mana saja):
+```bash
+curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"chat":{"id":-\?[0-9]*'
+```
+Angka setelah `"id":` adalah `TELEGRAM_CHAT_ID`:
+- chat pribadi: angka positif, mis. `123456789`;
+- grup: angka negatif, mis. `-1001234567890` (sertakan tanda minus).
+
+Jika hasilnya kosong, kirim pesan lagi ke bot/grup lalu ulangi. `getUpdates` hanya menyimpan pesan
+yang belum lama.
+
+### 3. Uji kirim pesan
+```bash
+curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage" -d chat_id=<CHAT_ID> -d text="Tes Judol Monitor"
+```
+Harus muncul `"ok":true` dan pesan masuk di Telegram. Jika `chat not found`: chat ID salah, atau bot
+belum di-Start / belum masuk grup.
+
+### 4. Pasang di server
+```bash
+cd /opt/judol-monitor
+nano .env        # isi TELEGRAM_BOT_TOKEN=... dan TELEGRAM_CHAT_ID=...
+docker compose up -d --force-recreate
+```
+`--force-recreate` wajib: `.env` hanya dibaca saat container dibuat.
+
+### 5. Verifikasi
+Alert berikutnya akan terkirim: laporan pertama sebuah app yang memiliki temuan atau token Google
+(app bersih tidak memicu pesan), temuan baru/berubah, token Google baru, host tidak melapor, atau cloaking.
+Status tiap alert tampil di dashboard bagian alert terakhir: terkirim, atau catatan kegagalan seperti
+`Telegram belum dikonfigurasi` / `gagal: HTTP Error 400`.
+
+Opsional: atur `ALERT_MIN_LEVEL=MEDIUM` agar temuan MEDIUM juga dikirim (disarankan untuk Moodle,
+lihat prioritas di SPEC). Token Google baru selalu dikirim, apa pun levelnya.
 
 ## nginx + HTTPS
 
