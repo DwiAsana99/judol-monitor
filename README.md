@@ -71,19 +71,45 @@ Bot Telegram: buat lewat @BotFather (dapat token), kirim satu pesan ke bot, lalu
 Jangan buka port 8000 langsung ke internet. Pasang nginx + Let's Encrypt di depannya. Agar IP asli VPS
 tercatat (`last_ip`), nginx wajib mengirim `X-Forwarded-For $remote_addr`.
 
-Config siap pakai untuk `monju.dwiputraasana.my.id` (HTTPS, redirect HTTP, rate limit, allowlist opsional):
-[deploy/nginx/monju.dwiputraasana.my.id.conf](deploy/nginx/monju.dwiputraasana.my.id.conf).
+Config untuk `monju.dwiputraasana.my.id` dipasang dalam dua tahap, karena config HTTPS merujuk file
+sertifikat yang belum ada sebelum certbot berhasil (`nginx -t` gagal: `cannot load certificate`):
+- [deploy/nginx/1-http.conf](deploy/nginx/1-http.conf): HTTP saja + jalur ACME, untuk meminta sertifikat.
+- [deploy/nginx/2-https.conf](deploy/nginx/2-https.conf): HTTPS, redirect HTTP, rate limit, allowlist opsional.
 
-Pemasangan di server (Debian/Ubuntu, DNS sudah mengarah ke server):
+Keduanya dipasang ke file yang sama, `/etc/nginx/conf.d/monju.dwiputraasana.my.id.conf`
+(jangan aktifkan keduanya bersamaan). Langkah di server (Debian/Ubuntu, DNS sudah mengarah ke server,
+container sudah jalan):
+
 ```bash
-sudo apt install nginx certbot python3-certbot-nginx
-sudo ufw allow 80,443/tcp                          # jika memakai ufw; buka juga di firewall provider
-sudo certbot certonly --nginx -d monju.dwiputraasana.my.id
-sudo cp deploy/nginx/monju.dwiputraasana.my.id.conf /etc/nginx/conf.d/
+# 0. Paket + firewall (buka juga port 80/443 di panel firewall provider)
+sudo apt install nginx certbot
+sudo ufw allow 80,443/tcp                          # jika memakai ufw
+
+# 1. Tahap HTTP
+sudo mkdir -p /var/www/certbot
+sudo cp deploy/nginx/1-http.conf /etc/nginx/conf.d/monju.dwiputraasana.my.id.conf
 sudo nginx -t && sudo systemctl reload nginx
+curl -I http://monju.dwiputraasana.my.id/          # dari luar server; harus 401 (minta login dashboard)
+
+# 2. Minta sertifikat
+sudo certbot certonly --webroot -w /var/www/certbot -d monju.dwiputraasana.my.id \
+     --deploy-hook "systemctl reload nginx"
+
+# 3. Tahap HTTPS
+sudo cp deploy/nginx/2-https.conf /etc/nginx/conf.d/monju.dwiputraasana.my.id.conf
+sudo nginx -t && sudo systemctl reload nginx
+curl -I https://monju.dwiputraasana.my.id/         # harus 401
 ```
-Perpanjangan sertifikat berjalan otomatis lewat timer certbot. Di agent, isi
-`"server_url": "https://monju.dwiputraasana.my.id"`.
+
+Jika langkah 1 atau 2 gagal, periksa:
+- `curl -I` dari luar tidak tersambung: port 80 masih tertutup di ufw atau firewall provider.
+- `nginx -t` mengeluh `conflicting server name` / `duplicate zone`: ada config lama untuk domain ini
+  (mis. di `/etc/nginx/sites-enabled/`); hapus yang lama.
+- certbot `unauthorized` / 404 pada `/.well-known/acme-challenge/`: DNS belum mengarah ke server ini, atau
+  domain lewat proxy (mis. Cloudflare oranye) yang mengubah respons.
+
+Perpanjangan sertifikat berjalan otomatis lewat timer certbot (memakai webroot yang sama; nginx di-reload
+lewat `--deploy-hook`). Di agent, isi `"server_url": "https://monju.dwiputraasana.my.id"` setelah tahap 3 selesai.
 
 ## Probe cloaking
 
