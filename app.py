@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS apps(id INTEGER PRIMARY KEY, host_id INTEGER, name TE
   files_scanned INTEGER DEFAULT 0, last_scan INTEGER, error TEXT, UNIQUE(host_id, name));
 CREATE TABLE IF NOT EXISTS findings(id INTEGER PRIMARY KEY, app_id INTEGER, file TEXT, sha256 TEXT, level TEXT,
   score INTEGER, hits TEXT, mtime TEXT, size INTEGER, first_seen INTEGER, last_seen INTEGER,
-  status TEXT, ack_sha TEXT, UNIQUE(app_id, file));
+  status TEXT, ack_sha TEXT, investigation TEXT, followup TEXT, note_by TEXT, note_at INTEGER, UNIQUE(app_id, file));
 CREATE TABLE IF NOT EXISTS google_tokens(id INTEGER PRIMARY KEY, app_id INTEGER, type TEXT, file TEXT, token TEXT,
   first_seen INTEGER, last_seen INTEGER, status TEXT, UNIQUE(app_id, file, token));
 CREATE TABLE IF NOT EXISTS sites(id INTEGER PRIMARY KEY, name TEXT, url TEXT UNIQUE, added INTEGER,
@@ -58,6 +58,11 @@ def conn():
 def init_db():
     with conn() as c:
         c.executescript(SCHEMA)
+        # DB lama: tambah kolom catatan investigasi yang belum ada
+        cols = {r[1] for r in c.execute("PRAGMA table_info(findings)")}
+        for col, typ in (("investigation", "TEXT"), ("followup", "TEXT"), ("note_by", "TEXT"), ("note_at", "INTEGER")):
+            if col not in cols:
+                c.execute("ALTER TABLE findings ADD COLUMN %s %s" % (col, typ))
         if not c.execute("SELECT 1 FROM meta WHERE k='csrf'").fetchone():
             c.execute("INSERT INTO meta VALUES('csrf', ?)", (secrets.token_hex(32),))
 
@@ -302,7 +307,8 @@ body{font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg);mar
 table{border-collapse:collapse;width:100%;margin:8px 0 24px}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
 th{color:var(--mut);font-weight:600}a{color:inherit}code{background:var(--card);padding:1px 4px;border-radius:3px;word-break:break-all}
 .p{padding:1px 8px;border-radius:10px;color:#fff;font-size:12px}.HIGH,.alert{background:var(--hi)}.MEDIUM{background:var(--md)}.LOW,.ok,.gone,.resolved{background:var(--ok)}.new,.unverified{background:var(--md)}.ack,.known,.error{background:#607d8b}
-input,button{font:inherit;padding:4px 8px}button{cursor:pointer}small{color:var(--mut)}form{display:inline}
+input,button,textarea{font:inherit;padding:4px 8px}textarea{width:100%;box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line)}
+tr.f td{border-bottom:0}.note{white-space:pre-wrap;margin:2px 0 6px}details summary{cursor:pointer;color:var(--mut)}label{display:block;margin:4px 0}button{cursor:pointer}small{color:var(--mut)}form{display:inline}
 </style>"""
 
 
@@ -370,8 +376,9 @@ def app_page(app_id: int, _: str = Depends(admin)):
         for f in rows:
             hits = "<br>".join("<b>%s</b> %s%s" % (E(h.get("rule", "")), E(h.get("desc", "")[:160]), (" <small>(baris %s)</small>" % h["line"]) if h.get("line") else "") for h in json.loads(f["hits"] or "[]"))
             btn = "<form method=post action='/finding/%d/ack'><input type=hidden name=csrf value='%s'><button title='Tandai aman untuk isi file saat ini'>tandai aman</button></form>" % (f["id"], tok) if f["status"] == "new" else ""
-            out.append("<tr><td>%s</td><td><code>%s</code><br><small>sha256 %s · %s B</small></td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                pill(f["level"]), E(f["file"]), E(f["sha256"][:12]), f["size"], f["score"], E(f["mtime"] or ""), hits, pill(f["status"]), btn))
+            out.append("<tr class=f id='f%d'><td>%s</td><td><code>%s</code><br><small>sha256 %s · %s B</small></td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                f["id"], pill(f["level"]), E(f["file"]), E(f["sha256"][:12]), f["size"], f["score"], E(f["mtime"] or ""), hits, pill(f["status"]), btn))
+            out.append("<tr><td></td><td colspan=6>%s</td></tr>" % note_block(f, tok))
         if not rows:
             out.append("<tr><td colspan=7><small>tidak ada temuan aktif</small></td></tr>")
         out.append("</table>")
@@ -388,6 +395,35 @@ def app_page(app_id: int, _: str = Depends(admin)):
         nres = c.execute("SELECT COUNT(*) FROM findings WHERE app_id=? AND status='resolved'", (app_id,)).fetchone()[0]
         out.append("<p><small>%d temuan lama sudah hilang/bersih (resolved).</small></p>" % nres)
     return page("%s/%s" % (a["host"], a["name"]), "".join(out))
+
+
+def note_block(f, tok):
+    """Catatan hasil investigasi & tindak lanjut untuk satu temuan, plus form untuk mengubahnya."""
+    inv, fu = f["investigation"] or "", f["followup"] or ""
+    shown = ""
+    if inv or fu:
+        shown = "<b>Hasil investigasi:</b><div class=note>%s</div><b>Tindak lanjut:</b><div class=note>%s</div><small>dicatat %s oleh %s</small>" % (
+            E(inv) or "<small>-</small>", E(fu) or "<small>-</small>",
+            time.strftime("%d-%m-%Y %H:%M", time.localtime(f["note_at"])) if f["note_at"] else "-", E(f["note_by"] or "-"))
+    form = ("<details><summary>%s</summary><form method=post action='/finding/%d/note' style='display:block'>"
+            "<input type=hidden name=csrf value='%s'>"
+            "<label>Hasil investigasi<textarea name=investigation rows=3 maxlength=4000>%s</textarea></label>"
+            "<label>Tindak lanjut<textarea name=followup rows=3 maxlength=4000>%s</textarea></label>"
+            "<button>Simpan catatan</button></form></details>") % (
+        "ubah catatan" if shown else "catat hasil investigasi & tindak lanjut", f["id"], tok, E(inv), E(fu))
+    return shown + form
+
+
+@app.post("/finding/{fid}/note")
+def finding_note(fid: int, investigation: str = Form(""), followup: str = Form(""), csrf: str = Form(""), user: str = Depends(admin)):
+    check_csrf(csrf)
+    with conn() as c:
+        f = c.execute("SELECT app_id FROM findings WHERE id=?", (fid,)).fetchone()
+        if not f:
+            raise HTTPException(404)
+        c.execute("UPDATE findings SET investigation=?, followup=?, note_by=?, note_at=? WHERE id=?",
+                  (investigation.strip()[:4000], followup.strip()[:4000], user, int(time.time()), fid))
+    return RedirectResponse("/app/%d#f%d" % (f["app_id"], fid), 303)
 
 
 @app.post("/finding/{fid}/ack")
