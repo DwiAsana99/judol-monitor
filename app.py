@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS hosts(id INTEGER PRIMARY KEY, name TEXT UNIQUE, token_hash TEXT UNIQUE,
   created INTEGER, last_report INTEGER, last_ip TEXT, stale_alerted INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS apps(id INTEGER PRIMARY KEY, host_id INTEGER, name TEXT, type TEXT,
-  files_scanned INTEGER DEFAULT 0, last_scan INTEGER, error TEXT, UNIQUE(host_id, name));
+  files_scanned INTEGER DEFAULT 0, last_scan INTEGER, error TEXT, recent TEXT, UNIQUE(host_id, name));
 CREATE TABLE IF NOT EXISTS findings(id INTEGER PRIMARY KEY, app_id INTEGER, file TEXT, sha256 TEXT, level TEXT,
   score INTEGER, hits TEXT, mtime TEXT, size INTEGER, first_seen INTEGER, last_seen INTEGER,
   status TEXT, ack_sha TEXT, investigation TEXT, followup TEXT, note_by TEXT, note_at INTEGER, UNIQUE(app_id, file));
@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS google_tokens(id INTEGER PRIMARY KEY, app_id INTEGER,
   first_seen INTEGER, last_seen INTEGER, status TEXT, UNIQUE(app_id, file, token));
 CREATE TABLE IF NOT EXISTS sites(id INTEGER PRIMARY KEY, name TEXT, url TEXT UNIQUE, added INTEGER,
   last_probe INTEGER, status TEXT, detail TEXT, last_alert_hash TEXT);
+CREATE TABLE IF NOT EXISTS watch_files(id INTEGER PRIMARY KEY, app_id INTEGER, file TEXT, sha256 TEXT, size INTEGER,
+  mtime INTEGER, first_seen INTEGER, last_seen INTEGER, changed_at INTEGER, status TEXT, UNIQUE(app_id, file));
 CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY, ts INTEGER, text TEXT, sent INTEGER DEFAULT 0, note TEXT);
 """
 
@@ -58,11 +60,13 @@ def conn():
 def init_db():
     with conn() as c:
         c.executescript(SCHEMA)
-        # DB lama: tambah kolom catatan investigasi yang belum ada
-        cols = {r[1] for r in c.execute("PRAGMA table_info(findings)")}
-        for col, typ in (("investigation", "TEXT"), ("followup", "TEXT"), ("note_by", "TEXT"), ("note_at", "INTEGER")):
-            if col not in cols:
-                c.execute("ALTER TABLE findings ADD COLUMN %s %s" % (col, typ))
+        # DB lama: tambah kolom yang belum ada
+        for table, add in (("findings", (("investigation", "TEXT"), ("followup", "TEXT"), ("note_by", "TEXT"), ("note_at", "INTEGER"))),
+                           ("apps", (("recent", "TEXT"),))):
+            cols = {r[1] for r in c.execute("PRAGMA table_info(%s)" % table)}
+            for col, typ in add:
+                if col not in cols:
+                    c.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, typ))
         if not c.execute("SELECT 1 FROM meta WHERE k='csrf'").fetchone():
             c.execute("INSERT INTO meta VALUES('csrf', ?)", (secrets.token_hex(32),))
 
@@ -181,6 +185,15 @@ def process_report(host, payload):
                 if key not in gseen and r["status"] != "gone":
                     c.execute("UPDATE google_tokens SET status='gone' WHERE id=?", (r["id"],))
 
+            # ---- file inti (hash) & file kode yang baru berubah; agent lama tidak mengirim keduanya
+            changed_w = process_watch(c, app_id, a["watch"], now) if isinstance(a.get("watch"), list) else []
+            if isinstance(a.get("recent"), dict):
+                rc = a["recent"]
+                files = [{"file": str(x.get("file", ""))[:500], "mtime": int(x.get("mtime", 0)), "ctime": int(x.get("ctime", 0)),
+                          "size": int(x.get("size", 0))} for x in (rc.get("files") or [])[:300] if isinstance(x, dict)]
+                c.execute("UPDATE apps SET recent=? WHERE id=?",
+                          (json.dumps({"days": int(rc.get("days", 7)), "total": int(rc.get("total", len(files))), "files": files}), app_id))
+
             # ---- susun pesan
             url = link("/app/%d" % app_id)
             head = "%s / %s" % (host["name"], name)
@@ -197,11 +210,45 @@ def process_report(host, payload):
                 lines = ["• [%s] %s — %s (%s)" % (x[0], x[1], x[4], x[3]) for x in sorted(new_items, key=lambda x: -x[2])
                          if LEVELS[x[0]] >= min_level][:10]
                 lines += ["• Token Google baru: %s di %s → cek apakah owner sah" % (k[1][:40], k[0]) for k in new_g[:5]]
+                lines += ["• File inti %s: %s" % (why, f) for f, why in changed_w[:10]]
+                if len(changed_w) > 10:
+                    lines.append("• ... dan %d file inti lain berubah" % (len(changed_w) - 10))
                 if lines:
                     alerts.append("🚨 %s: temuan baru\n%s%s" % (head, "\n".join(lines), ("\n" + url) if url else ""))
     for m in alerts:
         alert(m)
     return {"apps": len(payload.get("apps") or []), "alerts": len(alerts)}
+
+
+def process_watch(c, app_id, watch, now):
+    """Bandingkan hash file inti dengan laporan sebelumnya. Laporan pertama = baseline (tanpa alert).
+    Mengembalikan [(file, alasan)] untuk file yang baru / BERUBAH / hilang / muncul lagi."""
+    wex = {r["file"]: r for r in c.execute("SELECT * FROM watch_files WHERE app_id=?", (app_id,))}
+    baseline = not wex
+    seen, changed = set(), []
+    for w in watch[:2000]:
+        if not isinstance(w, dict):
+            continue
+        file, sha = str(w.get("file", ""))[:500], str(w.get("sha256", ""))[:64]
+        size, mt = int(w.get("size", 0)), int(w.get("mtime", 0))
+        seen.add(file)
+        r = wex.get(file)
+        if r is None:
+            c.execute("INSERT INTO watch_files(app_id,file,sha256,size,mtime,first_seen,last_seen,changed_at,status) VALUES(?,?,?,?,?,?,?,?,?)",
+                      (app_id, file, sha, size, mt, now, now, None if baseline else now, "ok" if baseline else "new"))
+            if not baseline:
+                changed.append((file, "baru"))
+        elif r["sha256"] != sha or r["status"] == "gone":
+            c.execute("UPDATE watch_files SET sha256=?, size=?, mtime=?, last_seen=?, changed_at=?, status='changed' WHERE id=?",
+                      (sha, size, mt, now, now, r["id"]))
+            changed.append((file, "muncul lagi" if r["status"] == "gone" else "BERUBAH"))
+        else:
+            c.execute("UPDATE watch_files SET last_seen=? WHERE id=?", (now, r["id"]))
+    for file, r in wex.items():
+        if file not in seen and r["status"] != "gone":
+            c.execute("UPDATE watch_files SET status='gone', changed_at=? WHERE id=?", (now, r["id"]))
+            changed.append((file, "hilang"))
+    return changed
 
 
 # ---------------------------------------------------------------- probe & watchdog
@@ -306,7 +353,7 @@ CSS = """<style>
 body{font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:16px;max-width:1200px;margin:auto}
 table{border-collapse:collapse;width:100%;margin:8px 0 24px}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
 th{color:var(--mut);font-weight:600}a{color:inherit}code{background:var(--card);padding:1px 4px;border-radius:3px;word-break:break-all}
-.p{padding:1px 8px;border-radius:10px;color:#fff;font-size:12px}.HIGH,.alert{background:var(--hi)}.MEDIUM{background:var(--md)}.LOW,.ok,.gone,.resolved{background:var(--ok)}.new,.unverified{background:var(--md)}.ack,.known,.error{background:#607d8b}
+.p{padding:1px 8px;border-radius:10px;color:#fff;font-size:12px}.HIGH,.alert{background:var(--hi)}.MEDIUM{background:var(--md)}.LOW,.ok,.gone,.resolved{background:var(--ok)}.new,.unverified{background:var(--md)}.changed,.beda{background:var(--hi)}.ack,.known,.error{background:#607d8b}
 input,button,textarea{font:inherit;padding:4px 8px}textarea{width:100%;box-sizing:border-box;background:var(--bg);color:var(--fg);border:1px solid var(--line)}
 tr.f td{border-bottom:0}.note{white-space:pre-wrap;margin:2px 0 6px}details summary{cursor:pointer;color:var(--mut)}label{display:block;margin:4px 0}button{cursor:pointer}small{color:var(--mut)}form{display:inline}
 </style>"""
@@ -392,9 +439,50 @@ def app_page(app_id: int, _: str = Depends(admin)):
         if not gt:
             out.append("<tr><td colspan=6><small>tidak ada</small></td></tr>")
         out.append("</table>")
+        out.append(watch_section(c, app_id))
+        out.append(recent_section(a["recent"]))
         nres = c.execute("SELECT COUNT(*) FROM findings WHERE app_id=? AND status='resolved'", (app_id,)).fetchone()[0]
         out.append("<p><small>%d temuan lama sudah hilang/bersih (resolved).</small></p>" % nres)
     return page("%s/%s" % (a["host"], a["name"]), "".join(out))
+
+
+def fmt_ts(ts):
+    return time.strftime("%d-%m-%Y %H:%M", time.localtime(ts)) if ts else "-"
+
+
+def watch_section(c, app_id):
+    """File inti yang pernah berubah/baru/hilang sejak baseline; yang tidak berubah hanya dihitung."""
+    rows = c.execute("SELECT * FROM watch_files WHERE app_id=? AND status!='ok' ORDER BY changed_at DESC", (app_id,)).fetchall()
+    n_ok = c.execute("SELECT COUNT(*) FROM watch_files WHERE app_id=? AND status='ok'", (app_id,)).fetchone()[0]
+    if not rows and not n_ok:
+        return ""
+    out = ["<h2>File inti dipantau</h2><p><small>index.php, config.php, .htaccess, .user.ini, robots.txt, sitemap.xml, cron, dll. "
+           "Dibandingkan dengan sha256 laporan sebelumnya. %d file tidak berubah sejak baseline.</small></p>" % n_ok]
+    if rows:
+        out.append("<table><tr><th>File</th><th>Status</th><th>Terdeteksi</th><th>mtime file</th><th>sha256</th></tr>")
+        for w in rows:
+            out.append("<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td><code>%s</code></td></tr>" % (
+                E(w["file"]), pill(w["status"]), fmt_ts(w["changed_at"]), fmt_ts(w["mtime"]), E((w["sha256"] or "")[:12])))
+        out.append("</table>")
+    return "".join(out)
+
+
+def recent_section(raw):
+    """Daftar file kode yang mtime/ctime-nya baru berubah, dari laporan terakhir agent."""
+    if not raw:
+        return ""
+    r = json.loads(raw)
+    files = r.get("files", [])
+    out = ["<h2>File kode berubah %d hari terakhir</h2><p><small>%d file (ditampilkan %d terbaru). ctime = waktu perubahan inode, "
+           "tidak bisa dimundurkan dengan <code>touch</code>; tanda <b>beda</b> = ctime &gt; 1 hari lebih baru dari mtime "
+           "(mtime mungkin dipalsukan).</small></p>" % (r.get("days", 7), r.get("total", len(files)), len(files))]
+    if files:
+        rows = "".join("<tr><td><code>%s</code></td><td>%s</td><td>%s%s</td><td>%s</td></tr>" % (
+            E(f["file"]), fmt_ts(f["mtime"]), fmt_ts(f["ctime"]),
+            " " + pill("beda") if f["ctime"] - f["mtime"] > 86400 else "", f["size"]) for f in files)
+        table = "<table><tr><th>File</th><th>mtime</th><th>ctime</th><th>Ukuran</th></tr>%s</table>" % rows
+        out.append(table if len(files) <= 20 else "<details><summary>tampilkan %d file</summary>%s</details>" % (len(files), table))
+    return "".join(out)
 
 
 def note_block(f, tok):

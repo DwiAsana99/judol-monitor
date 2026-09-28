@@ -97,6 +97,12 @@ SUSPECT_NAME_RE = re.compile(r"(^\.[a-z0-9_-]+\.php$|^(wp-)?(tmp|temp|shell|cmd|
 SUSPECT_SHORT_RE = re.compile(r"^[a-z0-9]{1,3}\.php$")  # huruf kecil saja: kelas Laravel (Tag.php, Job.php) tidak terkena
 UPLOAD_DIR_RE = re.compile(r"(^|[\\/])(uploads?|images?|img|media|files?|assets|storage|public[\\/]storage|cache|tmp|temp|repository|filedir|moodledata|localcache)([\\/]|$)", re.I)
 PHP_EXT = {".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".phps"}
+# ---------- Perubahan file: daftar file kode yang baru berubah + file inti yang dipantau hash-nya ----------
+RECENT_EXT = PHP_EXT | {".inc", ".py", ".sh", ".pl", ".cgi", ".html", ".htm", ".xml"}
+CONFIG_NAMES = {".htaccess", ".user.ini", "php.ini"}  # di mana pun letaknya
+ROOT_WATCH = {"index.php", "config.php", "wp-config.php", "wp-settings.php", "wp-load.php", "sysconfig.inc.php",
+              "sysconfig.local.inc.php", "robots.txt", "sitemap.xml", "public/index.php"}  # relatif terhadap root app
+MAX_RECENT, MAX_WATCH = 300, 2000
 GOOGLE_HTML_RE = re.compile(r"^google[0-9a-f]{16}\.html$", re.I)
 GOOGLE_META_RE = re.compile(r"<meta[^>]+name=['\"]google-site-verification['\"][^>]+content=['\"]([^'\"]+)['\"]|<meta[^>]+content=['\"]([^'\"]+)['\"][^>]+name=['\"]google-site-verification['\"]", re.I)
 
@@ -281,14 +287,28 @@ def profile_checks(rel, name, ext, profile):
     return hits
 
 
-def scan_tree(root, since=0, min_score=3, include_vendor=False, profile="generic"):
-    """Scan satu folder. Mengembalikan (results, google_findings, total_files).
-    Path pada hasil relatif terhadap root. Setiap result memuat sha256 file."""
+def file_sha256(path):
     import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read(MAX_SIZE * 2)).hexdigest()
+    except OSError:
+        return ""
+
+
+def scan_tree(root, since=0, min_score=3, include_vendor=False, profile="generic", extras=None, recent_days=7):
+    """Scan satu folder. Mengembalikan (results, google_findings, total_files).
+    Path pada hasil relatif terhadap root. Setiap result memuat sha256 file.
+    Jika `extras` (dict) diberikan, diisi dengan:
+      recent: file kode yang mtime/ctime-nya dalam `recent_days` hari (terbaru dulu, maks MAX_RECENT)
+      recent_total: jumlah sebenarnya sebelum dipotong
+      watch: file inti (ROOT_WATCH + semua .htaccess/.user.ini/php.ini) beserta sha256-nya"""
     root = os.path.abspath(root)
     profile_checks.root = root
     cutoff = time.time() - since * 86400 if since else 0
+    recent_cut = time.time() - recent_days * 86400
     results, google, total = [], [], 0
+    recent, watch = [], []
     for dirpath, dirnames, filenames in os.walk(root):
         if not include_vendor:
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS_DEFAULT]
@@ -300,6 +320,13 @@ def scan_tree(root, since=0, min_score=3, include_vendor=False, profile="generic
                 st0 = os.stat(full)
             except OSError:
                 continue
+            if extras is not None:
+                low = fn.lower()
+                if (low in CONFIG_NAMES or rel.replace("\\", "/").lower() in ROOT_WATCH) and len(watch) < MAX_WATCH:
+                    watch.append({"file": rel, "sha256": file_sha256(full), "size": st0.st_size, "mtime": int(st0.st_mtime)})
+                # ctime (waktu perubahan inode) tidak bisa dimundurkan dengan `touch`, jadi ikut dipakai
+                if (low in CONFIG_NAMES or ext_of(fn) in RECENT_EXT) and max(st0.st_mtime, st0.st_ctime) >= recent_cut:
+                    recent.append({"file": rel, "mtime": int(st0.st_mtime), "ctime": int(st0.st_ctime), "size": st0.st_size})
             if cutoff and st0.st_mtime < cutoff:
                 if GOOGLE_HTML_RE.match(fn):
                     google.append({"type": "file-html", "file": rel, "token": fn, "mtime": st0.st_mtime})
@@ -310,14 +337,12 @@ def scan_tree(root, since=0, min_score=3, include_vendor=False, profile="generic
                 hits.append(h)
                 score += h[1]
             if score >= min_score and hits:
-                try:
-                    with open(full, "rb") as f:
-                        sha = hashlib.sha256(f.read(MAX_SIZE * 2)).hexdigest()
-                except OSError:
-                    sha = ""
                 results.append({"score": score, "level": level(score), "file": rel,
                                 "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
-                                "size": st.st_size, "sha256": sha, "hits": hits})
+                                "size": st.st_size, "sha256": file_sha256(full), "hits": hits})
+    if extras is not None:
+        recent.sort(key=lambda r: -max(r["mtime"], r["ctime"]))
+        extras.update(recent=recent[:MAX_RECENT], recent_total=len(recent), watch=watch)
     return results, google, total
 
 
